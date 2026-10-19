@@ -15,9 +15,36 @@ pub fn accrued(rate: i128, elapsed: u64, balance: i128) -> i128 {
     unlocked.min(balance)
 }
 
+/// Whole seconds a stream needs to pay out `balance` at a constant per-second
+/// `rate`, rounded up so a partial final second counts as a full one (the
+/// stream isn't empty until that last second has run).
+///
+/// Returns `None` for a non-positive `rate`, since a stream that never pays
+/// out never depletes, and for a result that doesn't fit in a `u64`. A
+/// non-positive `balance` is already depleted, so it takes 0 seconds.
+pub fn seconds_to_deplete(rate: i128, balance: i128) -> Option<u64> {
+    if rate <= 0 {
+        return None;
+    }
+    if balance <= 0 {
+        return Some(0);
+    }
+
+    // `balance / rate` plus one for any remainder — the same as
+    // `ceil(balance / rate)`, without the `balance + rate - 1` overflow.
+    let whole = balance / rate;
+    let seconds = if balance % rate == 0 {
+        whole
+    } else {
+        whole + 1
+    };
+    u64::try_from(seconds).ok()
+}
+
 #[cfg(test)]
 mod test {
-    use super::accrued;
+    use super::{accrued, seconds_to_deplete};
+    use proptest::prelude::*;
 
     #[test]
     fn zero_rate_accrues_nothing() {
@@ -245,5 +272,93 @@ mod test {
             assert!(a >= prev, "accrual decreased as rate grew: rate={rate}");
             prev = a;
         }
+    }
+
+    #[test]
+    fn never_depletes_at_a_non_positive_rate() {
+        assert_eq!(seconds_to_deplete(0, 1_000), None);
+        assert_eq!(seconds_to_deplete(-5, 1_000), None);
+        assert_eq!(seconds_to_deplete(0, 0), None);
+    }
+
+    #[test]
+    fn empty_balance_is_already_depleted() {
+        assert_eq!(seconds_to_deplete(10, 0), Some(0));
+        assert_eq!(seconds_to_deplete(10, -1), Some(0));
+    }
+
+    #[test]
+    fn exact_division_takes_exactly_balance_over_rate() {
+        assert_eq!(seconds_to_deplete(10, 1_000), Some(100));
+        assert_eq!(seconds_to_deplete(1, 1), Some(1));
+    }
+
+    #[test]
+    fn partial_final_second_rounds_up() {
+        // 1_000 / 300 = 3.33 — three seconds leave 100 unpaid, so a fourth
+        // is needed.
+        assert_eq!(seconds_to_deplete(300, 1_000), Some(4));
+        // One unit past an exact multiple still needs the extra second.
+        assert_eq!(seconds_to_deplete(10, 101), Some(11));
+        // And one unit short of the next multiple is still that many seconds.
+        assert_eq!(seconds_to_deplete(10, 99), Some(10));
+        // A balance below the rate finishes inside the first second.
+        assert_eq!(seconds_to_deplete(1_000, 1), Some(1));
+    }
+
+    proptest! {
+        /// A positive balance at a positive rate always takes at least one
+        /// whole second (and never returns `None`) for values that fit in u64.
+        #[test]
+        fn positive_balance_never_depletes_in_zero_seconds(
+            rate in 1i128..1_000_000,
+            balance in 1i128..1_000_000_000_000,
+        ) {
+            let seconds = seconds_to_deplete(rate, balance)
+                .expect("bounded positive rate/balance fits in u64");
+            prop_assert!(seconds > 0, "rate={rate} balance={balance} -> {seconds}");
+        }
+
+        /// More balance can never deplete sooner at the same rate.
+        #[test]
+        fn monotonic_in_balance(
+            rate in 1i128..1_000_000,
+            low in 1i128..1_000_000_000,
+            extra in 0i128..1_000_000_000,
+        ) {
+            let high = low + extra;
+            let low_seconds = seconds_to_deplete(rate, low).unwrap();
+            let high_seconds = seconds_to_deplete(rate, high).unwrap();
+            prop_assert!(
+                low_seconds <= high_seconds,
+                "rate={rate} low={low} ({low_seconds}s) high={high} ({high_seconds}s)"
+            );
+        }
+
+        /// At the returned time `accrued` has paid out the whole balance,
+        /// and one second earlier it has not.
+        #[test]
+        fn accrued_matches_depletion_time(
+            rate in 1i128..1_000_000,
+            balance in 1i128..1_000_000_000_000,
+        ) {
+            let seconds = seconds_to_deplete(rate, balance).unwrap();
+            prop_assert_eq!(accrued(rate, seconds, balance), balance);
+            if seconds > 0 {
+                prop_assert!(
+                    accrued(rate, seconds - 1, balance) < balance,
+                    "rate={rate} balance={balance} depleted a second early"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn huge_values_neither_overflow_nor_panic() {
+        assert_eq!(seconds_to_deplete(1, i128::MAX), None);
+        assert_eq!(seconds_to_deplete(i128::MAX, i128::MAX), Some(1));
+        assert_eq!(seconds_to_deplete(i128::MAX, i128::MAX - 1), Some(1));
+        assert_eq!(seconds_to_deplete(2, i128::MAX), None);
+        assert_eq!(seconds_to_deplete(1, u64::MAX as i128), Some(u64::MAX));
     }
 }
